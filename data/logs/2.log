@@ -1,0 +1,3 @@
+{"offset": 0, "timestamp": 1776514167189, "key": "app1", "value": "Server started"}
+{"offset": 1, "timestamp": 1776514167191, "key": "app1", "value": "User logged in"}
+{"offset": 2, "timestamp": 1776514167192, "key": "app2", "value": "Background job running"}
