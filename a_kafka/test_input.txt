@@ -1,0 +1,3 @@
+Line 1: Hello Kafka
+Line 2: Connector works!
+Line 3: End to end test
