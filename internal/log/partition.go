@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/niteesh/gokafka/internal/protocol"
 )
@@ -132,8 +133,9 @@ func (p *Partition) Append(key, value []byte) (uint64, error) {
 	}
 
 	msg := &protocol.Message{
-		Key:   key,
-		Value: value,
+		Key:       key,
+		Value:     value,
+		Timestamp: time.Now().UnixMilli(),
 	}
 	msg.Offset = p.currentOffset
 

@@ -25,6 +25,7 @@ type Member struct {
 type Group struct {
 	mu            sync.Mutex
 	Name          string
+	Topic         string
 	Members       map[string]*Member
 	NumPartitions int
 }
@@ -48,16 +49,18 @@ func NewGroupCoordinator(dataDir string) *GroupCoordinator {
 	return gc
 }
 
-func (gc *GroupCoordinator) JoinGroup(groupName, memberID string, numPartitions int) ([]int, string, error) {
+func (gc *GroupCoordinator) JoinGroup(groupName, memberID, topic string, numPartitions int) ([]int, string, error) {
 	gc.mu.Lock()
 	g, ok := gc.groups[groupName]
 	if !ok {
 		g = &Group{
 			Name:    groupName,
+			Topic:   topic,
 			Members: make(map[string]*Member),
 		}
 		gc.groups[groupName] = g
 	}
+	g.Topic = topic
 	g.NumPartitions = numPartitions
 	gc.mu.Unlock()
 
@@ -98,7 +101,7 @@ func (gc *GroupCoordinator) Heartbeat(groupName, memberID string) ([]int, bool) 
 }
 
 // LeaveGroup removes a member gracefully.
-func (gc *GroupCoordinator) LeaveGroup(groupName, memberID string, numPartitions int) {
+func (gc *GroupCoordinator) LeaveGroup(groupName, memberID, topic string, numPartitions int) {
 	gc.mu.RLock()
 	g, ok := gc.groups[groupName]
 	gc.mu.RUnlock()
@@ -112,6 +115,22 @@ func (gc *GroupCoordinator) LeaveGroup(groupName, memberID string, numPartitions
 	gc.rebalance(g, numPartitions)
 	g.mu.Unlock()
 	gc.save()
+}
+
+func (gc *GroupCoordinator) ListGroups() []*Group {
+	gc.mu.RLock()
+	defer gc.mu.RUnlock()
+	var list []*Group
+	for _, g := range gc.groups {
+		list = append(list, g)
+	}
+	return list
+}
+
+func (gc *GroupCoordinator) GetGroup(name string) *Group {
+	gc.mu.RLock()
+	defer gc.mu.RUnlock()
+	return gc.groups[name]
 }
 
 func (gc *GroupCoordinator) rebalance(g *Group, numPartitions int) map[string][]int {

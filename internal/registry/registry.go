@@ -57,6 +57,16 @@ func (r *SchemaRegistry) GetLatest(subject string) (*Schema, error) {
 	return &versions[len(versions)-1], nil
 }
 
+func (r *SchemaRegistry) ListSubjects() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	list := []string{}
+	for s := range r.schemas {
+		list = append(list, s)
+	}
+	return list
+}
+
 func (r *SchemaRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// Simple REST API
 	if req.Method == http.MethodPost {
@@ -79,6 +89,11 @@ func (r *SchemaRegistry) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if req.Method == http.MethodGet {
 		subject := req.URL.Query().Get("subject")
+		if subject == "" {
+			subjects := r.ListSubjects()
+			json.NewEncoder(w).Encode(subjects)
+			return
+		}
 		s, err := r.GetLatest(subject)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusNotFound)

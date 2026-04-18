@@ -1,14 +1,28 @@
-import React, { useState, useEffect } from 'react';
-import { LayoutDashboard, Database, Activity, ShieldCheck, Box, HardDrive, Cpu } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { LayoutDashboard, Database, Activity, ShieldCheck, Box, MessageSquare, Users, Book, User } from 'lucide-react';
+import Dashboard from './components/Dashboard';
+import Topics from './components/Topics';
+import System from './components/System';
+import Security from './components/Security';
+import Interact from './components/Interact';
+import Groups from './components/Groups';
+import Registry from './components/Registry';
 
 interface BrokerMetadata {
   id: number;
   addr: string;
 }
 
+interface PartitionMetadata {
+  id: number;
+  leader: number;
+  replicas: number[];
+  isr: number[];
+}
+
 interface TopicInfo {
   name: string;
-  partitions: number;
+  partitions: PartitionMetadata[];
 }
 
 const App = () => {
@@ -16,32 +30,69 @@ const App = () => {
   const [topics, setTopics] = useState<TopicInfo[]>([]);
   const [metrics, setMetrics] = useState<string>('');
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [currentUser, setCurrentUser] = useState(localStorage.getItem('kafka-user') || 'admin');
 
   useEffect(() => {
-    const fetchData = async () => {
-      try {
-        const [metaRes, topicRes, metricsRes] = await Promise.all([
-          fetch('/api/metadata'),
-          fetch('/api/topics'),
-          fetch('/api/metrics')
-        ]);
-        
-        setMetadata(await metaRes.json());
-        setTopics(await topicRes.json());
-        setMetrics(await metricsRes.text());
-      } catch (err) {
-        console.error("Failed to fetch cluster data:", err);
-      }
-    };
+    localStorage.setItem('kafka-user', currentUser);
+  }, [currentUser]);
 
+  const fetchData = useCallback(async () => {
+    try {
+      const [metaRes, metricsRes] = await Promise.all([
+        fetch('/api/metadata', { headers: { 'X-User': currentUser } }),
+        fetch('/api/metrics', { headers: { 'X-User': currentUser } })
+      ]);
+      
+      const metaData = await metaRes.json();
+      
+      const brokerList = Object.entries(metaData.brokers || {}).map(([id, addr]) => ({
+        id: parseInt(id),
+        addr: addr as string
+      }));
+      
+      const topicList = Object.values(metaData.topics || {}).map((t: any) => ({
+        name: t.name,
+        partitions: t.partitions.map((p: any) => ({
+          id: p.id,
+          leader: p.leader,
+          replicas: p.replicas || [],
+          isr: p.isr || []
+        }))
+      }));
+
+      setMetadata(brokerList);
+      setTopics(topicList);
+      setMetrics(await metricsRes.text());
+    } catch (err) {
+      console.error("Failed to fetch cluster data:", err);
+    }
+  }, []);
+
+  useEffect(() => {
     fetchData();
     const interval = setInterval(fetchData, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [fetchData]);
 
-  const parseMetric = (name: string) => {
-    const match = metrics.match(new RegExp(`^${name}\\s+(\\d+)`, 'm'));
-    return match ? match[1] : '0';
+  const renderContent = () => {
+    switch (activeTab) {
+      case 'dashboard':
+        return <Dashboard metrics={metrics} topics={topics} brokers={metadata} />;
+      case 'topics':
+        return <Topics topics={topics} onRefresh={fetchData} currentUser={currentUser} />;
+      case 'interact':
+        return <Interact topics={topics} currentUser={currentUser} />;
+      case 'groups':
+        return <Groups currentUser={currentUser} />;
+      case 'registry':
+        return <Registry currentUser={currentUser} />;
+      case 'system':
+        return <System brokers={metadata} topics={topics} />;
+      case 'security':
+        return <Security topics={topics} currentUser={currentUser} />;
+      default:
+        return <Dashboard metrics={metrics} topics={topics} brokers={metadata} />;
+    }
   };
 
   return (
@@ -59,6 +110,15 @@ const App = () => {
           <button onClick={() => setActiveTab('topics')} className={`nav-item ${activeTab === 'topics' ? 'active' : ''}`}>
             <Database size={20} /> Topics
           </button>
+          <button onClick={() => setActiveTab('interact')} className={`nav-item ${activeTab === 'interact' ? 'active' : ''}`}>
+            <MessageSquare size={20} /> Interact
+          </button>
+          <button onClick={() => setActiveTab('groups')} className={`nav-item ${activeTab === 'groups' ? 'active' : ''}`}>
+            <Users size={20} /> Groups
+          </button>
+          <button onClick={() => setActiveTab('registry')} className={`nav-item ${activeTab === 'registry' ? 'active' : ''}`}>
+            <Book size={20} /> Registry
+          </button>
           <button onClick={() => setActiveTab('system')} className={`nav-item ${activeTab === 'system' ? 'active' : ''}`}>
             <Activity size={20} /> System
           </button>
@@ -66,6 +126,27 @@ const App = () => {
             <ShieldCheck size={20} /> Security
           </button>
         </nav>
+
+        <div style={{ padding: '24px', background: 'rgba(255,255,255,0.02)', borderRadius: '12px', margin: '16px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--text-secondary)', fontSize: '12px', marginBottom: '12px' }}>
+            <User size={14} /> ACTIVE PRINCIPAL
+          </div>
+          <input 
+            type="text" 
+            value={currentUser} 
+            onChange={(e) => setCurrentUser(e.target.value)}
+            style={{ 
+              width: '100%', 
+              background: 'rgba(0,0,0,0.2)', 
+              border: '1px solid var(--border-color)', 
+              borderRadius: '8px', 
+              padding: '8px 12px', 
+              color: 'white',
+              fontSize: '13px',
+              outline: 'none'
+            }}
+          />
+        </div>
 
         <div style={{ marginTop: 'auto', padding: '16px', borderTop: '1px solid var(--border-color)' }}>
           <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>CLUSTER STATUS</div>
@@ -77,67 +158,7 @@ const App = () => {
       </div>
 
       <div className="main-content">
-        <header style={{ marginBottom: '40px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div>
-            <h1 style={{ fontSize: '32px', fontWeight: 600 }}>Cluster Overview</h1>
-            <p style={{ color: 'var(--text-secondary)' }}>Real-time telemetry from minimal_Kafaka cluster</p>
-          </div>
-          <div className="glass" style={{ padding: '8px 16px', display: 'flex', gap: '24px' }}>
-             <div style={{ textAlign: 'right' }}>
-               <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>CPU</div>
-               <div style={{ fontWeight: 600 }}>12%</div>
-             </div>
-             <div style={{ textAlign: 'right' }}>
-               <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>MEM</div>
-               <div style={{ fontWeight: 600 }}>244MB</div>
-             </div>
-          </div>
-        </header>
-
-        <div className="metrics-grid">
-           <div className="glass metric-card">
-              <div className="metric-label">Messages In</div>
-              <div className="metric-value" style={{ color: 'var(--accent-color)' }}>{parseMetric('gokafka_produce_total')}</div>
-              <div style={{ fontSize: '12px', color: 'var(--success)' }}>+12% from last min</div>
-           </div>
-           <div className="glass metric-card">
-              <div className="metric-label">Messages Out</div>
-              <div className="metric-value">{parseMetric('gokafka_consume_total')}</div>
-              <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>Active streams: 4</div>
-           </div>
-           <div className="glass metric-card">
-              <div className="metric-label">Disk Storage</div>
-              <div className="metric-value">{(parseInt(parseMetric('gokafka_storage_bytes')) / 1024).toFixed(2)} KB</div>
-              <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>Log Compaction: Enabled</div>
-           </div>
-        </div>
-
-        <section>
-          <h2 style={{ fontSize: '20px', marginBottom: '20px', display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <Database size={20} /> Active Topics
-          </h2>
-          <div className="glass topic-list">
-            {topics.map(t => (
-              <div key={t.name} className="topic-row">
-                <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-                  <div className="glass" style={{ width: '40px', height: '40px', display: 'grid', placeItems: 'center', borderRadius: '12px' }}>
-                    <Box size={20} color="var(--text-secondary)" />
-                  </div>
-                  <div>
-                    <div style={{ fontWeight: 600 }}>{t.name}</div>
-                    <div style={{ fontSize: '12px', color: 'var(--text-secondary)' }}>{t.partitions} Partitions • Replication: 3</div>
-                  </div>
-                </div>
-                <div className="status-badge status-online">HEALTHY</div>
-              </div>
-            ))}
-            {topics.length === 0 && (
-              <div style={{ padding: '40px', textAlign: 'center', color: 'var(--text-secondary)' }}>
-                No topics detected in the cluster.
-              </div>
-            )}
-          </div>
-        </section>
+        {renderContent()}
       </div>
     </div>
   );

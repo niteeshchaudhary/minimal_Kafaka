@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"sync"
@@ -90,16 +92,22 @@ func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	mux.HandleFunc("/produce/binary", authWrap("topic", security.PermWrite, b.handleProduceBinary))
 	mux.HandleFunc("/produce/batch", authWrap("topic", security.PermWrite, b.handleProduceBatch))
 	
-	mux.HandleFunc("/topics", b.handleListTopics)
+	mux.HandleFunc("/topics", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			b.handleCreateTopic(w, r)
+		} else if r.Method == http.MethodDelete {
+			b.handleDeleteTopic(w, r)
+		} else {
+			b.handleListTopics(w, r)
+		}
+	})
 	mux.HandleFunc("/metadata", b.handleMetadata)
+	mux.HandleFunc("/acls", b.handleACLs)
 	mux.HandleFunc("/metrics", b.metrics.ServeHTTP)
 	mux.HandleFunc("/subjects", b.registry.ServeHTTP)
 	mux.HandleFunc("/ping", b.handlePing)
-	mux.HandleFunc("/group/join", b.handleGroupJoin)
-	mux.HandleFunc("/group/heartbeat", b.handleGroupHeartbeat)
-	mux.HandleFunc("/group/leave", b.handleGroupLeave)
-	mux.HandleFunc("/offset/commit", b.handleOffsetCommit)
-	mux.HandleFunc("/offset/fetch", b.handleOffsetFetch)
+	mux.HandleFunc("/groups", b.handleGroups)
+	mux.HandleFunc("/security/tls", b.handleTLSConfig)
 	mux.ServeHTTP(w, r)
 }
 
@@ -117,6 +125,14 @@ type PartitionMetadata struct {
 	ID       int   `json:"id"`
 	Leader   int   `json:"leader"`
 	Replicas []int `json:"replicas"`
+	ISR      []int `json:"isr"`
+}
+
+type JSONMessage struct {
+	Offset    uint64 `json:"offset"`
+	Timestamp int64  `json:"timestamp"`
+	Key       string `json:"key"`
+	Value     string `json:"value"`
 }
 
 func (b *Broker) handleMetadata(w http.ResponseWriter, r *http.Request) {
@@ -148,12 +164,14 @@ func (b *Broker) handleMetadata(w http.ResponseWriter, r *http.Request) {
 			Name: tName,
 		}
 		for i := 0; i < len(t.Partitions); i++ {
+			p := t.Partitions[i]
 			// Dynamic leadership: Select from ACTIVE brokers only
 			leaderIdx := i % numActive
 			tm.Partitions = append(tm.Partitions, PartitionMetadata{
 				ID:       i,
 				Leader:   activeIDs[leaderIdx],
 				Replicas: activeIDs,
+				ISR:      p.ISR,
 			})
 		}
 		res.Topics[tName] = tm
@@ -317,7 +335,7 @@ func (b *Broker) handleGroupJoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	assigned, memberID, err := b.coordinator.JoinGroup(req.Group, req.Member, len(topic.Partitions))
+	assigned, memberID, err := b.coordinator.JoinGroup(req.Group, req.Member, req.Topic, len(topic.Partitions))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -372,8 +390,52 @@ func (b *Broker) handleGroupLeave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b.coordinator.LeaveGroup(req.Group, req.Member, len(topic.Partitions))
+	b.coordinator.LeaveGroup(req.Group, req.Member, req.Topic, len(topic.Partitions))
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (b *Broker) handleGroups(w http.ResponseWriter, r *http.Request) {
+	groups := b.coordinator.ListGroups()
+	
+	type GroupInfo struct {
+		Name       string         `json:"name"`
+		Topic      string         `json:"topic"`
+		Members    []string       `json:"members"`
+		TotalLag   uint64         `json:"total_lag"`
+		Partitions map[int]uint64 `json:"partition_lag"`
+	}
+
+	res := []GroupInfo{}
+	for _, g := range groups {
+		info := GroupInfo{
+			Name:       g.Name,
+			Topic:      g.Topic,
+			Members:    make([]string, 0),
+			Partitions: make(map[int]uint64),
+		}
+		for id := range g.Members {
+			info.Members = append(info.Members, id)
+		}
+
+		// Calculate lag
+		if g.Topic != "" {
+			t, _ := b.storage.GetOrCreateTopic(g.Topic)
+			for i := 0; i < len(t.Partitions); i++ {
+				current := t.Partitions[i].CurrentOffset()
+				committed := b.offsets.Fetch(g.Name, g.Topic, i)
+				lag := uint64(0)
+				if current > committed {
+					lag = current - committed
+				}
+				info.Partitions[i] = lag
+				info.TotalLag += lag
+			}
+		}
+		res = append(res, info)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
 }
 
 func (b *Broker) handleProduceBatch(w http.ResponseWriter, r *http.Request) {
@@ -475,7 +537,11 @@ func (b *Broker) handleProduce(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Acks == "all" {
-		<-partition.AwaitISR(offset)
+		select {
+		case <-partition.AwaitISR(offset):
+		case <-time.After(5 * time.Second):
+			// Timeout to prevent UI hang if ISR is not met
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -523,8 +589,18 @@ func (b *Broker) handleConsume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	jsonMessages := make([]JSONMessage, 0, len(messages))
+	for _, m := range messages {
+		jsonMessages = append(jsonMessages, JSONMessage{
+			Offset:    m.Offset,
+			Timestamp: m.Timestamp,
+			Key:       string(m.Key),
+			Value:     string(m.Value),
+		})
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(messages)
+	json.NewEncoder(w).Encode(jsonMessages)
 	b.metrics.IncConsume()
 }
 
@@ -618,6 +694,116 @@ func (b *Broker) handleListTopics(w http.ResponseWriter, r *http.Request) {
 	topics := b.storage.ListTopics()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(topics)
+}
+
+type CreateTopicRequest struct {
+	Name       string `json:"name"`
+	Partitions int    `json:"partitions"`
+}
+
+func (b *Broker) handleCreateTopic(w http.ResponseWriter, r *http.Request) {
+	var req CreateTopicRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	if req.Partitions <= 0 {
+		req.Partitions = 3
+	}
+
+	_, err := b.storage.CreateTopic(req.Name, req.Partitions)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (b *Broker) handleDeleteTopic(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+
+	err := b.storage.DeleteTopic(name)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (b *Broker) handleACLs(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		acls := b.security.ListACLs()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(acls)
+	case http.MethodPost:
+		var req struct {
+			Topic      string              `json:"topic"`
+			User       string              `json:"user"`
+			Permission security.Permission `json:"permission"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		b.security.AddACL(req.Topic, req.User, req.Permission)
+		w.WriteHeader(http.StatusCreated)
+	case http.MethodDelete:
+		topic := r.URL.Query().Get("topic")
+		user := r.URL.Query().Get("user")
+		if topic == "" || user == "" {
+			http.Error(w, "topic and user are required", http.StatusBadRequest)
+			return
+		}
+		b.security.RemoveACL(topic, user)
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (b *Broker) handleTLSConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Cert string `json:"cert"`
+		Key  string `json:"key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// For MVP: Save to data directory and update state
+	certPath := filepath.Join(b.storage.DataDir(), "server.crt")
+	keyPath := filepath.Join(b.storage.DataDir(), "server.key")
+
+	if err := os.WriteFile(certPath, []byte(req.Cert), 0644); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := os.WriteFile(keyPath, []byte(req.Key), 0600); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	b.SetTLS(certPath, keyPath)
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "TLS configuration updated. Restart broker for full effect.")
 }
 
 // Run starts the HTTP server.

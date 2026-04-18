@@ -16,12 +16,12 @@ const (
 
 // Message represents a single record in binary format.
 type Message struct {
-	Offset      uint64
-	Timestamp   int64
-	Compression uint8
-	Key         []byte
-	Value       []byte
-	CRC         uint32
+	Offset      uint64 `json:"offset"`
+	Timestamp   int64  `json:"timestamp"`
+	Compression uint8  `json:"compression"`
+	Key         []byte `json:"key"`
+	Value       []byte `json:"value"`
+	CRC         uint32 `json:"crc"`
 }
 
 // Encode serializes the message into a byte slice.
