@@ -29,12 +29,12 @@ func NewTopic(baseDir, name string, numPartitions int, maxSegSize uint64) (*Topi
 
 // GetPartition selects a partition based on the key (hash-based).
 // If key is empty, it defaults to partition 0 (for MVP simplicity, Phase 1).
-func (t *Topic) GetPartition(key string) *Partition {
-	if key == "" {
+func (t *Topic) GetPartition(key []byte) *Partition {
+	if len(key) == 0 {
 		return t.Partitions[0]
 	}
 	h := fnv.New32a()
-	h.Write([]byte(key))
+	h.Write(key)
 	idx := int(h.Sum32()) % len(t.Partitions)
 	return t.Partitions[idx]
 }

@@ -1,8 +1,9 @@
 package log
 
 import (
-	"bufio"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -12,6 +13,7 @@ type Segment struct {
 	baseOffset uint64
 	logFile    *os.File
 	index      *Index
+	timeIndex  *TimeIndex
 	dir        string
 	maxSize    uint64
 	size       uint64
@@ -38,51 +40,70 @@ func NewSegment(dir string, baseOffset uint64, maxSize uint64) (*Segment, error)
 		return nil, err
 	}
 
+	timeIdxPath := filepath.Join(dir, fmt.Sprintf("%020d.timeindex", baseOffset))
+	timeIdx, err := NewTimeIndex(timeIdxPath)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Segment{
 		baseOffset: baseOffset,
 		logFile:    logFile,
 		index:      index,
+		timeIndex:  timeIdx,
 		dir:        dir,
 		maxSize:    maxSize,
 		size:       uint64(fi.Size()),
 	}, nil
 }
 
+// WriteRawAt streams raw bytes from the segment to the given writer.
+func (s *Segment) WriteRawAt(w io.Writer, pos uint64, size uint32) (int64, error) {
+	sr := io.NewSectionReader(s.logFile, int64(pos), int64(size))
+	return io.CopyN(w, sr, int64(size))
+}
+
 // Write appends a message to the segment and updates the index.
 func (s *Segment) Write(msg *Message) (uint64, error) {
-	data, err := msg.Marshal()
-	if err != nil {
-		return 0, err
-	}
+	data := msg.Encode()
+	dataSize := uint32(len(data))
+	
+	// Total bytes to write: 4 (size) + len(data)
+	buf := make([]byte, 4+len(data))
+	binary.BigEndian.PutUint32(buf[0:4], dataSize)
+	copy(buf[4:], data)
 
 	pos := s.size
-	if _, err := s.logFile.Write(append(data, '\n')); err != nil {
+	if _, err := s.logFile.Write(buf); err != nil {
 		return 0, err
 	}
 
 	if err := s.index.Write(msg.Offset, pos); err != nil {
 		return 0, err
 	}
-
-	s.size += uint64(len(data) + 1)
+	if err := s.timeIndex.Write(msg.Timestamp, msg.Offset); err != nil {
+		return 0, err
+	}
+	s.size += uint64(len(buf))
 	return msg.Offset, nil
 }
 
 // ReadAt reads a message at a specific file position.
 func (s *Segment) ReadAt(pos uint64) (*Message, error) {
-	// For simplicity, we use a scanner but seek to the position first.
-	// In a high-performance system, we'd use pre-allocated buffers.
-	if _, err := s.logFile.Seek(int64(pos), 0); err != nil {
+	// Read size first
+	sizeBuf := make([]byte, 4)
+	if _, err := s.logFile.ReadAt(sizeBuf, int64(pos)); err != nil {
+		return nil, err
+	}
+	dataSize := binary.BigEndian.Uint32(sizeBuf)
+
+	// Read data
+	data := make([]byte, dataSize)
+	if _, err := s.logFile.ReadAt(data, int64(pos+4)); err != nil {
 		return nil, err
 	}
 
-	reader := bufio.NewReader(s.logFile)
-	line, err := reader.ReadBytes('\n')
-	if err != nil {
-		return nil, err
-	}
-
-	return UnmarshalMessage(line)
+	return UnmarshalMessage(data)
 }
 
 // IsFull returns true if the segment has reached its size limit.
@@ -92,9 +113,8 @@ func (s *Segment) IsFull() bool {
 
 // Close closes the segment files.
 func (s *Segment) Close() error {
-	if err := s.index.Close(); err != nil {
-		return err
-	}
+	s.index.Close()
+	s.timeIndex.Close()
 	return s.logFile.Close()
 }
 

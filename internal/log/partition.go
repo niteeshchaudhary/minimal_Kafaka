@@ -2,12 +2,15 @@ package log
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/niteesh/gokafka/internal/protocol"
 )
 
 const (
@@ -24,6 +27,11 @@ type Partition struct {
 	activeSegment *Segment
 	currentOffset uint64
 	maxSegSize    uint64
+
+	// ISR management
+	isrMu         sync.RWMutex
+	ISR           []int // In-Sync Replicas (Broker IDs)
+	ISRListeners  map[uint64]chan struct{} // Offset -> channel to notify
 }
 
 // NewPartition initializes a partition and recovers its segments.
@@ -42,6 +50,7 @@ func NewPartition(baseDir, topic string, id int, maxSegSize uint64) (*Partition,
 		topic:      topic,
 		ID:         id,
 		maxSegSize: maxSegSize,
+		ISRListeners: make(map[uint64]chan struct{}),
 	}
 
 	if err := p.loadSegments(); err != nil {
@@ -109,7 +118,7 @@ func (p *Partition) loadSegments() error {
 }
 
 // Append adds a new message, rolling the segment if full.
-func (p *Partition) Append(key, value string) (uint64, error) {
+func (p *Partition) Append(key, value []byte) (uint64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -122,7 +131,10 @@ func (p *Partition) Append(key, value string) (uint64, error) {
 		p.activeSegment = newSeg
 	}
 
-	msg := NewMessage(key, value)
+	msg := &protocol.Message{
+		Key:   key,
+		Value: value,
+	}
 	msg.Offset = p.currentOffset
 
 	offset, err := p.activeSegment.Write(msg)
@@ -141,29 +153,23 @@ func (p *Partition) CurrentOffset() uint64 {
 	return p.currentOffset
 }
 
-// Fetch retrieves messages starting from a given offset.
+// Fetch retrieves messages starting from a given offset into a slice.
 func (p *Partition) Fetch(startOffset uint64, maxMessages uint64) ([]*Message, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
 	var messages []*Message
 	for _, seg := range p.segments {
-		// Check if startOffset is in this segment or later segments
-		// This is a simple linear search; in production we'd use binary search on segments.
-		
-		// Find logical end offset of this segment (approx)
 		numEntries := seg.index.size / entryWidth
 		if numEntries == 0 {
 			continue
 		}
 		
 		lastOff, _, _ := seg.index.Read(int64(numEntries - 1))
-		
 		if startOffset > lastOff {
 			continue
 		}
 
-		// Found the segment or segments to read from
 		for i := int64(0); i < int64(numEntries); i++ {
 			off, pos, err := seg.index.Read(i)
 			if err != nil {
@@ -182,6 +188,73 @@ func (p *Partition) Fetch(startOffset uint64, maxMessages uint64) ([]*Message, e
 	}
 
 	return messages, nil
+}
+
+// FetchStream writes raw message bytes directly to the given writer for zero-copy streaming.
+func (p *Partition) FetchStream(w io.Writer, startOffset uint64, maxMessages uint64) (int, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	count := 0
+	for _, seg := range p.segments {
+		numEntries := seg.index.size / entryWidth
+		if numEntries == 0 {
+			continue
+		}
+
+		lastOff, _, _ := seg.index.Read(int64(numEntries - 1))
+		if startOffset > lastOff {
+			continue
+		}
+
+		// Find start and end positions in this segment
+		startPos := uint64(0)
+		endPos := uint64(0)
+		startFound := false
+
+		for i := int64(0); i < int64(numEntries); i++ {
+			off, pos, err := seg.index.Read(i)
+			if err != nil {
+				continue
+			}
+
+			if off >= startOffset {
+				if !startFound {
+					startPos = pos
+					startFound = true
+				}
+				
+				// Calculate size of this message: [Size(4) + Payload(var)]
+				// We can read size from file, or just use index to find next pos.
+				// For the last message in segment, we use seg.size.
+				var nextPos uint64
+				if i+1 < int64(numEntries) {
+					_, nextPos, _ = seg.index.Read(i + 1)
+				} else {
+					nextPos = seg.size
+				}
+				endPos = nextPos
+				count++
+				
+				if uint64(count) >= maxMessages {
+					break
+				}
+			}
+		}
+
+		if startFound {
+			size := uint32(endPos - startPos)
+			if _, err := seg.WriteRawAt(w, startPos, size); err != nil {
+				return count, err
+			}
+		}
+
+		if uint64(count) >= maxMessages {
+			break
+		}
+	}
+
+	return count, nil
 }
 
 // TotalSize returns the total size of all segments in the partition.
@@ -219,6 +292,46 @@ func (p *Partition) CheckRetention(maxSize uint64) {
 		
 		p.segments = p.segments[1:]
 	}
+}
+
+// UpdateISR updates the in-sync replicas list and notifies listeners if needed.
+func (p *Partition) UpdateISR(newISR []int, minOffset uint64) {
+	p.isrMu.Lock()
+	p.ISR = newISR
+	
+	// Notify listeners that have been reached by this minOffset
+	for off, ch := range p.ISRListeners {
+		if off <= minOffset {
+			close(ch)
+			delete(p.ISRListeners, off)
+		}
+	}
+	p.isrMu.Unlock()
+}
+
+// AwaitISR returns a channel that will be closed when the given offset is replicated to all ISR members.
+func (p *Partition) AwaitISR(offset uint64) chan struct{} {
+	p.isrMu.Lock()
+	defer p.isrMu.Unlock()
+	
+	ch := make(chan struct{})
+	p.ISRListeners[offset] = ch
+	return ch
+}
+
+// SearchByTimestamp finds the earliest offset whose timestamp is >= targetTs.
+func (p *Partition) SearchByTimestamp(targetTs int64) (uint64, error) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	for _, seg := range p.segments {
+		off, err := seg.timeIndex.Search(targetTs)
+		if err == nil {
+			return off, nil
+		}
+	}
+
+	return 0, fmt.Errorf("no offset found for timestamp")
 }
 
 // Close closes all segments.
