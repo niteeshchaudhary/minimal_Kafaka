@@ -1,0 +1,515 @@
+package broker
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/niteesh/gokafka/internal/coordinator"
+	"github.com/niteesh/gokafka/internal/log"
+	"github.com/niteesh/gokafka/internal/offset"
+)
+
+// Broker represents the HTTP server layer.
+type Broker struct {
+	ID          int
+	Addr        string
+	Peers       map[int]string
+	activeBrokers map[int]bool
+	muActive      sync.RWMutex
+	storage     *log.StorageEngine
+	coordinator *coordinator.GroupCoordinator
+	offsets     *offset.OffsetManager
+}
+
+// NewBroker initializes a new broker with storage, coordinator, and offsets.
+func NewBroker(id int, addr string, peers map[int]string, dataDir string, maxSegSize uint64) *Broker {
+	om, _ := offset.NewOffsetManager(dataDir)
+	return &Broker{
+		ID:            id,
+		Addr:          addr,
+		Peers:         peers,
+		activeBrokers: make(map[int]bool),
+		storage:       log.NewStorageEngine(dataDir, 3, maxSegSize),
+		coordinator:   coordinator.NewGroupCoordinator(dataDir),
+		offsets:       om,
+	}
+}
+
+// ServeHTTP handles routing for the broker.
+func (b *Broker) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/produce", b.handleProduce)
+	mux.HandleFunc("/produce/batch", b.handleProduceBatch)
+	mux.HandleFunc("/consume", b.handleConsume)
+	mux.HandleFunc("/topics", b.handleListTopics)
+	mux.HandleFunc("/metadata", b.handleMetadata)
+	mux.HandleFunc("/ping", b.handlePing)
+	mux.HandleFunc("/group/join", b.handleGroupJoin)
+	mux.HandleFunc("/group/heartbeat", b.handleGroupHeartbeat)
+	mux.HandleFunc("/group/leave", b.handleGroupLeave)
+	mux.HandleFunc("/offset/commit", b.handleOffsetCommit)
+	mux.HandleFunc("/offset/fetch", b.handleOffsetFetch)
+	mux.ServeHTTP(w, r)
+}
+
+type MetadataResponse struct {
+	Brokers map[int]string           `json:"brokers"`
+	Topics  map[string]TopicMetadata `json:"topics"`
+}
+
+type TopicMetadata struct {
+	Name       string              `json:"name"`
+	Partitions []PartitionMetadata `json:"partitions"`
+}
+
+type PartitionMetadata struct {
+	ID       int   `json:"id"`
+	Leader   int   `json:"leader"`
+	Replicas []int `json:"replicas"`
+}
+
+func (b *Broker) handleMetadata(w http.ResponseWriter, r *http.Request) {
+	topics := b.storage.ListTopics()
+	res := MetadataResponse{
+		Brokers: make(map[int]string),
+		Topics:  make(map[string]TopicMetadata),
+	}
+
+	res.Brokers[b.ID] = b.Addr
+	
+	b.muActive.RLock()
+	var activeIDs []int
+	activeIDs = append(activeIDs, b.ID)
+	for id, addr := range b.Peers {
+		if b.activeBrokers[id] {
+			res.Brokers[id] = addr
+			activeIDs = append(activeIDs, id)
+		}
+	}
+	b.muActive.RUnlock()
+
+	sort.Ints(activeIDs)
+	numActive := len(activeIDs)
+
+	for _, tName := range topics {
+		t, _ := b.storage.GetOrCreateTopic(tName)
+		tm := TopicMetadata{
+			Name: tName,
+		}
+		for i := 0; i < len(t.Partitions); i++ {
+			// Dynamic leadership: Select from ACTIVE brokers only
+			leaderIdx := i % numActive
+			tm.Partitions = append(tm.Partitions, PartitionMetadata{
+				ID:       i,
+				Leader:   activeIDs[leaderIdx],
+				Replicas: activeIDs,
+			})
+		}
+		res.Topics[tName] = tm
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(res)
+}
+
+func (b *Broker) startReplication() {
+	ticker := time.NewTicker(2 * time.Second)
+	for range ticker.C {
+		topics := b.storage.ListTopics()
+		
+		b.muActive.RLock()
+		var activeIDs []int
+		activeIDs = append(activeIDs, b.ID)
+		for id := range b.Peers {
+			if b.activeBrokers[id] {
+				activeIDs = append(activeIDs, id)
+			}
+		}
+		b.muActive.RUnlock()
+		
+		sort.Ints(activeIDs)
+		numActive := len(activeIDs)
+		if numActive == 0 { continue }
+
+		for _, tName := range topics {
+			t, _ := b.storage.GetOrCreateTopic(tName)
+			for i := 0; i < len(t.Partitions); i++ {
+				leaderID := activeIDs[i%numActive]
+				if leaderID != b.ID {
+					leaderAddr, ok := b.Peers[leaderID]
+					if ok {
+						go b.syncPartition(tName, i, leaderAddr)
+					}
+				}
+			}
+		}
+	}
+}
+
+func (b *Broker) syncPartition(topic string, partition int, leaderAddr string) {
+	t, _ := b.storage.GetOrCreateTopic(topic)
+	p := t.Partitions[partition]
+
+	// Fetch from our current high-water mark
+	offset := p.CurrentOffset()
+
+	resp, err := http.Get(fmt.Sprintf("http://%s/consume?topic=%s&partition=%d&offset=%d", leaderAddr, topic, partition, offset))
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	var messages []log.Message
+	if err := json.NewDecoder(resp.Body).Decode(&messages); err != nil {
+		return
+	}
+
+	for _, m := range messages {
+		p.Append(m.Key, m.Value)
+	}
+}
+
+type OffsetCommitRequest struct {
+	Group     string `json:"group"`
+	Topic     string `json:"topic"`
+	Partition int    `json:"partition"`
+	Offset    uint64 `json:"offset"`
+}
+
+type OffsetFetchResponse struct {
+	Offset uint64 `json:"offset"`
+}
+
+func (b *Broker) handleOffsetCommit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req OffsetCommitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := b.offsets.Commit(req.Group, req.Topic, req.Partition, req.Offset); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (b *Broker) handleOffsetFetch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	group := r.URL.Query().Get("group")
+	topicName := r.URL.Query().Get("topic")
+	partitionStr := r.URL.Query().Get("partition")
+	partitionID, _ := strconv.Atoi(partitionStr)
+
+	offset := b.offsets.Fetch(group, topicName, partitionID)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(OffsetFetchResponse{
+		Offset: offset,
+	})
+}
+
+type GroupJoinRequest struct {
+	Group  string `json:"group"`
+	Member string `json:"member,omitempty"`
+	Topic  string `json:"topic"`
+}
+
+type GroupJoinResponse struct {
+	Member             string `json:"member"`
+	AssignedPartitions []int  `json:"assigned_partitions"`
+}
+
+type GroupHeartbeatRequest struct {
+	Group  string `json:"group"`
+	Member string `json:"member"`
+}
+
+func (b *Broker) handleGroupJoin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req GroupJoinRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	topic, err := b.storage.GetOrCreateTopic(req.Topic)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	assigned, memberID, err := b.coordinator.JoinGroup(req.Group, req.Member, len(topic.Partitions))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(GroupJoinResponse{
+		Member:             memberID,
+		AssignedPartitions: assigned,
+	})
+}
+
+func (b *Broker) handleGroupHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req GroupHeartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	assigned, ok := b.coordinator.Heartbeat(req.Group, req.Member)
+	if !ok {
+		http.Error(w, "Member not found", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"assigned_partitions": assigned,
+	})
+}
+
+func (b *Broker) handleGroupLeave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req GroupJoinRequest // reuse struct for convenience
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	topic, err := b.storage.GetOrCreateTopic(req.Topic)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	b.coordinator.LeaveGroup(req.Group, req.Member, len(topic.Partitions))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (b *Broker) handleProduceBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ProduceBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Topic == "" || len(req.Messages) == 0 {
+		http.Error(w, "Topic and messages are required", http.StatusBadRequest)
+		return
+	}
+
+	topic, err := b.storage.GetOrCreateTopic(req.Topic)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	var offsets []uint64
+	var partitionID int
+	for _, m := range req.Messages {
+		partition := topic.GetPartition(m.Key)
+		partitionID = partition.ID // Assumes all messages in a batch go to the same partition if key is same, or we just track the last one for the response structure.
+		// In a real Kafka, batching is per-partition. For simplicity here, we batch by request and route each message.
+		offset, err := partition.Append(m.Key, m.Value)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		offsets = append(offsets, offset)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ProduceResponse{
+		Topic:       req.Topic,
+		PartitionID: partitionID,
+		Offsets:     offsets,
+	})
+}
+
+type ProduceRequest struct {
+	Topic string `json:"topic"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type ProduceBatchRequest struct {
+	Topic    string           `json:"topic"`
+	Messages []ProduceRequest `json:"messages"`
+}
+
+type ProduceResponse struct {
+	Topic       string   `json:"topic"`
+	PartitionID int      `json:"partition"`
+	Offset      uint64   `json:"offset"`
+	Offsets     []uint64 `json:"offsets,omitempty"`
+}
+
+func (b *Broker) handleProduce(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req ProduceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if req.Topic == "" || req.Value == "" {
+		http.Error(w, "Topic and Value are required", http.StatusBadRequest)
+		return
+	}
+
+	topic, err := b.storage.GetOrCreateTopic(req.Topic)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	partition := topic.GetPartition(req.Key)
+	offset, err := partition.Append(req.Key, req.Value)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ProduceResponse{
+		Topic:       req.Topic,
+		PartitionID: partition.ID,
+		Offset:      offset,
+	})
+}
+
+func (b *Broker) handleConsume(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	query := r.URL.Query()
+	topicName := query.Get("topic")
+	partitionStr := query.Get("partition")
+	offsetStr := query.Get("offset")
+
+	if topicName == "" || partitionStr == "" || offsetStr == "" {
+		http.Error(w, "topic, partition, and offset are required", http.StatusBadRequest)
+		return
+	}
+
+	partitionID, _ := strconv.Atoi(partitionStr)
+	offset, _ := strconv.ParseUint(offsetStr, 10, 64)
+
+	topic, err := b.storage.GetOrCreateTopic(topicName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if partitionID < 0 || partitionID >= len(topic.Partitions) {
+		http.Error(w, "Invalid partition", http.StatusBadRequest)
+		return
+	}
+
+	messages, err := topic.Partitions[partitionID].Fetch(offset, 100)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(messages)
+}
+
+func (b *Broker) handleListTopics(w http.ResponseWriter, r *http.Request) {
+	topics := b.storage.ListTopics()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(topics)
+}
+
+// Run starts the HTTP server.
+func (b *Broker) Run(port int) error {
+	fmt.Printf("Broker %d starting on port %d...\n", b.ID, port)
+	go b.startHealthCheck()
+	go b.startReplication()
+	go b.startRetentionChecker()
+	return http.ListenAndServe(fmt.Sprintf(":%d", port), b)
+}
+
+func (b *Broker) startRetentionChecker() {
+	ticker := time.NewTicker(30 * time.Second)
+	// Small retention size for MVP/Testing: 50MB
+	maxSize := uint64(50 * 1024 * 1024)
+	for range ticker.C {
+		for _, tName := range b.storage.ListTopics() {
+			t, _ := b.storage.GetOrCreateTopic(tName)
+			for _, p := range t.Partitions {
+				p.CheckRetention(maxSize)
+			}
+		}
+	}
+}
+
+func (b *Broker) handlePing(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+}
+
+func (b *Broker) startHealthCheck() {
+	ticker := time.NewTicker(2 * time.Second)
+	client := &http.Client{Timeout: 1 * time.Second}
+	for range ticker.C {
+		for id, addr := range b.Peers {
+			resp, err := client.Get(fmt.Sprintf("http://%s/ping", addr))
+			b.muActive.Lock()
+			if err == nil && resp.StatusCode == http.StatusOK {
+				b.activeBrokers[id] = true
+			} else {
+				if b.activeBrokers[id] {
+					fmt.Printf("⚠️ Broker %d detected as DOWN\n", id)
+				}
+				b.activeBrokers[id] = false
+			}
+			if resp != nil {
+				resp.Body.Close()
+			}
+			b.muActive.Unlock()
+		}
+	}
+}
